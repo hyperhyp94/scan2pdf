@@ -13,11 +13,22 @@ Optional direkt in den Paperless-Eingang schieben.
 
 | Schritt | Was passiert |
 |---|---|
-| Papiererkennung | Otsu-Schwelle + Projektionen: findet das helle Blatt auf dunklem/gemischtem Untergrund |
-| Rand-Crop | dunkle Pixel = Inhalt, weiße Ränder werden weggeschnitten |
-| Deskew | Projektionsprofil-Maximum über ±4° → schiefe Fotos werden gerade gezogen |
-| A4 | Skalierung auf A4 minus 8 mm Rand, weißer Hintergrund, zentriert (Querformat bei Querformat-Bild) |
-| OCR | `ocrmypdf -l deu+eng --deskew --optimize 1` in Container `scan2pdf-ocr` |
+| Papiererkennung | Papier = **hell + farbneutral** (HSV). Holz/Tisch ist braun = gesättigt → fällt raus. Größte papierfarbene Fläche = Blatt |
+| Perspektive | Ist das Blatt komplett im Bild: Viereck-Erkennung + `warpPerspective` → gerade Rechteck-Projektion |
+| Fallback | Blatt angeschnitten: Blattform maskieren, alles außerhalb weiß übermalen |
+| Untergrund | `_whiteout_background()`: gesättigte (braune) Restpixel werden weiß → kein Tisch mehr sichtbar |
+| Begradigen | Projektionsprofil-Maximum, grob→fein über ±14°, vorzeichenunabhängig |
+| Ausleuchtung | `_flatten_illumination()`: Bild ÷ weichgezeichnetes Eigenbild → Schatten/Falten weg, Papier überall weiß. **Der wichtigste Schritt für OCR-Qualität** |
+| A4 | Passend auf A4 (210×297 mm) skaliert, 3 mm weißer Rand, zentriert (Querformat bleibt Querformat) |
+| OCR | `tesseract --psm 6 -l deu+eng pdf` pro Seite (Tesseract schreibt das PDF selbst, unsichtbarer Textlayer) |
+| Zusammenführen | Seiten-PDFs per PyMuPDF mergen → ein PDF für alle Bilder |
+| Komprimieren | Ghostscript `/prepress`, 200 dpi JPEG q85 → typ. 0,4 MB/Seite |
+
+### Warum nicht ocrmypdf?
+
+`ocrmypdf` hat bei den Testfotos die Tabellenzone („Ihre Einzelposten", Beträge) **komplett
+verworfen** — Tesseract direkt auf derselben Seite liest sie problemlos. Deshalb macht
+Tesseract das PDF selbst, Ghostscript komprimiert danach (Textlayer bleibt erhalten).
 
 ## OCR-Container
 

@@ -1,4 +1,9 @@
-"""Bild -> A4-zugeschnitten -> OCR -> PDF Pipeline."""
+"""Bild -> A4-zugeschnitten -> OCR -> PDF Pipeline.
+
+Papiererkennung: Papier ist hell UND farbneutral, Holz/Tisch ist gesaettigt.
+Groesste papierfarbene Flaeche = Blatt -> freistellen, begradigen (Projektions-
+profil), Rest-Untergrund weiss uebermalen, dann auf A4 setzen und OCR.
+"""
 import io
 import os
 import subprocess
@@ -6,14 +11,20 @@ import uuid
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - Fallback ohne OpenCV
+    cv2 = None
 
 DPI = 300
 A4_PORTRAIT_MM = (210, 297)
 A4_LANDSCAPE_MM = (297, 210)
-MARGIN_MM = 8          # weisser Rand um das Dokument auf der A4-Seite
+MARGIN_MM = 3          # weisser Rand um das Dokument auf der A4-Seite
+JPEG_QUALITY = 80
 OCR_CONTAINER = "scan2pdf-ocr"
 OCR_LANG = "deu+eng"
 
@@ -23,7 +34,7 @@ def _mm2px(mm, dpi=DPI):
 
 
 def _otsu(gray_u8):
-    """Otsu-Schwelle auf einem uint8-Graustufenbild."""
+    """Otsu-Schwelle auf einem uint8-Graustufenbild (nur Fallback ohne cv2)."""
     hist = np.bincount(gray_u8.ravel(), minlength=256).astype(float)
     total = gray_u8.size
     sum_all = np.dot(np.arange(256), hist)
@@ -48,53 +59,98 @@ def _otsu(gray_u8):
     return best
 
 
-def _detect_page(img):
-    """Findet das Papier im Foto (helles Rechteck auf dunklerem Untergrund)."""
-    gray = np.asarray(img.convert("L"), dtype=np.uint8)
-    h, w = gray.shape
-    border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
-    # Untergrund schon hell -> Papier fuellt das Bild, kein Page-Crop noetig
-    if np.percentile(border, 85) > 215:
-        return None
-    thresh = max(140, _otsu(gray))
-    mask = gray >= thresh
-    rows = mask.mean(axis=1)
-    cols = mask.mean(axis=0)
-    r_idx = np.where(rows > 0.12)[0]
-    c_idx = np.where(cols > 0.12)[0]
-    if len(r_idx) == 0 or len(c_idx) == 0:
-        return None
-    top, bottom = int(r_idx[0]), int(r_idx[-1])
-    left, right = int(c_idx[0]), int(c_idx[-1])
-    # Plausibilitaet: Papier muss mind. 15% der Flaeche sein
-    if (bottom - top) * (right - left) < 0.15 * h * w:
-        return None
-    return left, top, right + 1, bottom + 1
+def _order_quad(pts):
+    """4 Punkte in Reihenfolge [oben-links, oben-rechts, unten-rechts, unten-links]."""
+    pts = np.array(pts, dtype=np.float32).reshape(4, 2)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).ravel()
+    return np.array([pts[np.argmin(s)], pts[np.argmin(d)],
+                     pts[np.argmax(s)], pts[np.argmax(d)]], dtype=np.float32)
 
 
-def _content_bbox(img, thresh):
-    """Bounding-Box des Inhalts (alles was deutlich dunkler als Papier ist)."""
-    rgb = img.convert("RGB")
-    arr = np.asarray(rgb, dtype=np.int16)
-    gray = arr.mean(axis=2)
-    mask = gray < thresh
-    h, w = gray.shape
-    rows = mask.sum(axis=1)
-    cols = mask.sum(axis=0)
-    r_idx = np.where(rows > max(2, w * 0.002))[0]
-    c_idx = np.where(cols > max(2, h * 0.002))[0]
-    if len(r_idx) == 0 or len(c_idx) == 0:
-        return None
-    top, bottom = int(r_idx[0]), int(r_idx[-1])
-    left, right = int(c_idx[0]), int(c_idx[-1])
-    # Plausibilitaet: ein Crop darf nicht fast alles wegwerfen
-    if (bottom - top) < 0.20 * h or (right - left) < 0.20 * w:
-        return None
-    return left, top, right + 1, bottom + 1
+def _paper_mask(bgr):
+    """Binaermaske des Papiers: hell UND farbneutral (Holz ist braun = gesaettigt)."""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    v = cv2.GaussianBlur(hsv[:, :, 2], (5, 5), 0)
+    s = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
+    mask = ((v > 135) & (s < 60)).astype(np.uint8) * 255
+    # Text loechert das Papier -> schliessen, dann Stoerungen entfernen
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((11, 11), np.uint8))
+    return mask
 
 
-def _deskew(img):
-    """Schieflage korrigieren (Projektionsprofil-Maximum, +/-4 Grad)."""
+def _largest_contour(mask):
+    cnts = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    if not cnts:
+        return None
+    return max(cnts, key=cv2.contourArea)
+
+
+def _is_scan(img_bgr):
+    """Foto oder schon ein Scan? (Scan = Rand hell UND farbneutral)"""
+    small = cv2.resize(img_bgr, (320, 320))
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    h, w = hsv.shape[:2]
+    d = max(2, int(min(h, w) * 0.05))
+    edges = np.concatenate([hsv[:d].reshape(-1, 3), hsv[-d:].reshape(-1, 3),
+                            hsv[:, :d].reshape(-1, 3), hsv[:, -d:].reshape(-1, 3)])
+    return float(np.median(edges[:, 2])) > 200 and float(np.median(edges[:, 1])) < 35
+
+
+def border_quality(img, strip=0.03):
+    """Wie sauber ist der Blattrand? Median-Helligkeit + Anteil holzartiger Pixel."""
+    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    h, w = arr.shape[:2]
+    d = max(2, int(min(h, w) * strip))
+    edges = np.concatenate([arr[:d].reshape(-1, 3), arr[-d:].reshape(-1, 3),
+                            arr[:, :d].reshape(-1, 3), arr[:, -d:].reshape(-1, 3)])
+    hsv = cv2.cvtColor(edges.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
+    bright = float(np.median(hsv[:, 2]))
+    wood = float(((hsv[:, 1] > 85) & (hsv[:, 2] < 215)).mean())
+    return bright, wood
+
+
+def _whiteout_background(img):
+    """Holzartige (gesaettigte, mittelhelle) Pixel weiss machen — Rest-Untergrund killen."""
+    bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    s = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
+    v = cv2.GaussianBlur(hsv[:, :, 2], (5, 5), 0)
+    wood = ((s > 85) & (v < 215)).astype(np.uint8)
+    wood = cv2.dilate(wood, np.ones((7, 7), np.uint8))
+    if wood.mean() > 0.75:            # fast alles "Holz" -> Fehlalarm, nicht anfassen
+        return img
+    out = bgr.copy()
+    out[wood > 0] = (255, 255, 255)
+    return Image.fromarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
+
+
+def _mask_polygon(img, bgr=None):
+    """Papierflaeche als gefuellte Maske (Blattform, kein Viereck-Zwang)."""
+    if bgr is None:
+        bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+    mask = _paper_mask(bgr)
+    cnt = _largest_contour(mask)
+    if cnt is None or cv2.contourArea(cnt) < 0.12 * h * w:
+        return None
+    poly = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(poly, [cnt], 255)
+    # leicht nach innen: Blattrand anschneiden statt Untergrund mitnehmen
+    d = max(3, int(min(h, w) * 0.004))
+    poly = cv2.erode(poly, np.ones((d * 2 + 1, d * 2 + 1), np.uint8))
+    if poly.sum() == 0:
+        return None
+    return poly
+
+
+def _deskew(img, max_angle=4.0, step=0.25, expand=True):
+    """Schieflage korrigieren: Projektionsprofil-Maximum, grob -> fein.
+
+    Vorzeichen-unabhaengig (es wird nur die Ausrichtung bewertet), daher auch
+    fuer groessere Winkel geeignet.
+    """
     small = img.convert("L")
     scale = 900 / max(small.size)
     if scale < 1:
@@ -105,54 +161,206 @@ def _deskew(img):
     mask = (arr < thresh).astype(np.float32)
     if mask.sum() < 50:
         return img
-    best_angle, best_score = 0.0, -1.0
-    for angle in np.arange(-4.0, 4.01, 0.25):
-        rot = Image.fromarray((mask * 255).astype(np.uint8)).rotate(
-            angle, resample=Image.BILINEAR, expand=False, fillcolor=0)
-        profile = np.asarray(rot, dtype=np.float32).sum(axis=1)
-        score = float(np.var(np.diff(profile)))
-        if score > best_score:
-            best_score, best_angle = score, float(angle)
-    if abs(best_angle) < 0.25:
+    src = Image.fromarray((mask * 255).astype(np.uint8))
+
+    def score(angle):
+        rot = np.asarray(src.rotate(angle, resample=Image.BILINEAR, fillcolor=0),
+                         dtype=np.float32).sum(axis=1)
+        return float(np.var(np.diff(rot)))
+
+    coarse = np.arange(-max_angle, max_angle + 1e-6, max(2.0, step * 8))
+    best = max(coarse, key=score)
+    fine = np.arange(max(-max_angle, best - 2.0),
+                     min(max_angle, best + 2.0) + 1e-6, step)
+    best = max(fine, key=score)
+    if abs(best) < 0.25:
         return img
-    return img.rotate(-best_angle, resample=Image.BICUBIC, expand=True,
+    # Vorzeichen: der Score-Peak liegt bei dem Winkel, um den gedreht werden muss
+    return img.rotate(float(best), resample=Image.BICUBIC, expand=expand,
                       fillcolor="white")
 
 
-def crop_white_borders(img):
-    """Papier finden, grauen Untergrund und weisse Raender wegschneiden."""
-    img = ImageOps.exif_transpose(img).convert("RGB")
-    if max(img.size) > 4000:  # grosse Handyfotos etwas verkleinern (Speed)
-        img.thumbnail((4000, 4000), Image.LANCZOS)
-    img = ImageOps.autocontrast(img, cutoff=1)
+def _straighten(img):
+    """Auch groessere Schieflagen (bis ~14 Grad) begradigen."""
+    return _deskew(img, max_angle=14.0, step=0.25, expand=False)
 
-    page = _detect_page(img)
-    work = img.crop(page) if page else img
-    work = _trim(work)
-    tilted = _deskew(work)
-    if tilted.size != work.size:
-        work = _trim(tilted)
+
+def _page_occupancy(img, bgr=None):
+    """Anteil der Bildflaeche, den das erkannte Blatt einnimmt."""
+    if bgr is None:
+        bgr = cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+    mask = _paper_mask(bgr)
+    cnt = _largest_contour(mask)
+    if cnt is None:
+        return 0.0, 1.0
+    x, y, cw, ch = cv2.boundingRect(cnt)
+    ratio = (cw / ch) if ch else 1.0
+    return cv2.contourArea(cnt) / (h * w), ratio
+
+
+def _find_quad(bgr, min_area=0.30):
+    """Blatt als konvexes Viereck (nur wenn das Blatt komplett im Bild ist)."""
+    if cv2 is None:
+        return None
+    h, w = bgr.shape[:2]
+    scale = min(1.0, 1400.0 / max(h, w))
+    small = cv2.resize(bgr, (int(w * scale), int(h * scale)),
+                       interpolation=cv2.INTER_AREA) if scale < 1 else bgr
+    mask = _paper_mask(small)
+    cnt = _largest_contour(mask)
+    if cnt is None or cv2.contourArea(cnt) < min_area * small.shape[0] * small.shape[1]:
+        return None
+    peri = cv2.arcLength(cnt, True)
+    corners = None
+    for eps in (0.02, 0.03, 0.05, 0.08):
+        approx = cv2.approxPolyDP(cnt, eps * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            corners = approx.reshape(4, 2).astype(np.float32)
+            break
+    if corners is None:
+        return None
+    corners = np.array(_order_quad(corners / scale), dtype=np.float32)
+    center = corners.mean(axis=0)
+    corners = center + (corners - center) * 0.996   # 0.4 % nach innen
+    return np.clip(corners, [0, 0], [w - 1, h - 1]).astype(np.float32)
+
+
+def _warp_quad(bgr, quad):
+    """Perspektivisch entzerren: Viereck -> Rechteck."""
+    tl, tr, br, bl = quad
+    out_w = int(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
+    out_h = int(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))
+    if out_w < 200 or out_h < 200:
+        return None
+    dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1],
+                    [0, out_h - 1]], dtype=np.float32)
+    mat = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
+    warped = cv2.warpPerspective(bgr, mat, (out_w, out_h), flags=cv2.INTER_CUBIC,
+                                 borderMode=cv2.BORDER_CONSTANT,
+                                 borderValue=(255, 255, 255))
+    return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+
+
+def _extract_page(img):
+    """Papier freistellen, begradigen, Untergrund entfernen."""
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    if max(img.size) > 4000:            # grosse Handyfotos verkleinern (Speed)
+        img.thumbnail((4000, 4000), Image.LANCZOS)
+    img = ImageOps.autocontrast(img, cutoff=1, preserve_tone=False)
+
+    if cv2 is None:
+        return _deskew(_trim_bright(img))
+
+    bgr = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+    if _is_scan(bgr):                   # schon sauber gescannt -> nichts freistellen
+        return img
+
+    occ, ratio = _page_occupancy(img, bgr)
+    # Blatt fast komplett im Bild -> ganze Seite behalten (Original-Layout!)
+    full_page = occ >= 0.45 and (0.55 <= ratio <= 0.88 or 1.13 <= ratio <= 1.60)
+
+    # 1) Bestfall: Blatt komplett sichtbar -> perspektivisch entzerren
+    work = None
+    quad = _find_quad(bgr)
+    if quad is not None:
+        work = _warp_quad(bgr, quad)
+
+    # 2) sonst: Blattform maskieren, Untergrund weissmalen
+    if work is None:
+        poly = _mask_polygon(img, bgr)
+        if poly is not None:
+            x, y, pw, ph = cv2.boundingRect(poly)
+            pad = max(2, int(min(bgr.shape[:2]) * 0.002))
+            box = (max(0, x - pad), max(0, y - pad),
+                   min(bgr.shape[1], x + pw + pad), min(bgr.shape[0], y + ph + pad))
+            if (box[2] - box[0]) >= 0.35 * bgr.shape[1] and \
+               (box[3] - box[1]) >= 0.35 * bgr.shape[0]:
+                keep = poly[box[1]:box[3], box[0]:box[2]]
+                cut = bgr[box[1]:box[3], box[0]:box[2]].copy()
+                cut[keep == 0] = (255, 255, 255)
+                work = Image.fromarray(cv2.cvtColor(cut, cv2.COLOR_BGR2RGB))
+    if work is None:
+        work = img
+
+    work = _straighten(work)
+    work = _whiteout_background(work)   # Rest-Untergrund (Holz) entfernen
+    work = _flatten_illumination(work)  # Schatten weg -> weisses Papier, harter Text
+
+    if not full_page:                   # kleines Blatt -> auf den Inhalt zuschneiden
+        fixed = _trim_bright(work)
+        if fixed.size != work.size:
+            work = fixed
     else:
-        work = tilted
+        # nur die beim Drehen entstandenen weissen Ecken abschneiden
+        work = _trim_white_edges(work)
+    work = _whiteout_background(work)
     return work
 
 
-def _trim(work):
-    """Weisse Raender um den Inhalt wegschneiden."""
-    gray = np.asarray(work.convert("L"), dtype=np.float32)
-    paper = float(np.percentile(gray, 85))
-    thresh = min(215.0, max(60.0, paper - 45))
+def _flatten_illumination(img):
+    """Ausleuchtung normalisieren: Schatten/Flecken -> gleichmaessig weisses Papier.
 
-    bbox = None
-    for t in (thresh, thresh * 0.75, thresh * 0.5):
-        bbox = _content_bbox(work, t)
-        if bbox:
-            break
+    Papier wird durch sein eigenes, stark weichgezeichnetes Hintergrundbild
+    geteilt. Dadurch wird die Seite ueberall gleich hell und der Text bekommt
+    deutlich mehr Kontrast (entscheidend fuer OCR).
+    """
+    if cv2 is None:
+        return img
+    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    h, w = arr.shape[:2]
+    sigma = max(15, int(min(h, w) * 0.03))
+    bg = cv2.GaussianBlur(arr, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    bg = np.maximum(bg, 1).astype(np.float32)
+    norm = np.clip(arr.astype(np.float32) * (250.0 / bg), 0, 255).astype(np.uint8)
+    return Image.fromarray(norm)
+
+
+def _trim_white_edges(img, thresh=254):
+    """Nur reinweisse Ränder (Dreh-Ecken) abschneiden, Inhalt bleibt unangetastet."""
+    arr = np.asarray(img.convert("L"), dtype=np.uint8)
+    mask = arr < thresh
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return img
+    return img.crop((int(cols[0]), int(rows[0]),
+                     int(cols[-1]) + 1, int(rows[-1]) + 1))
+
+
+def _brightness_mask(img):
+    """Maske der dunklen Bildinhalte (Text/Stempel) auf dem Papier."""
+    gray = np.asarray(img.convert("L"), dtype=np.float32)
+    paper = float(np.percentile(gray, 80))
+    thresh = min(215.0, max(60.0, paper - 45))
+    mask = gray < thresh
+    return mask, gray
+
+
+def _content_bbox(img):
+    """Bounding-Box des Inhalts (dunkle Pixel) relativ zur Blatthelligkeit."""
+    mask, gray = _brightness_mask(img)
+    h, w = mask.shape
+    rows = mask.sum(axis=1)
+    cols = mask.sum(axis=0)
+    r_idx = np.where(rows > max(2, w * 0.002))[0]
+    c_idx = np.where(cols > max(2, h * 0.002))[0]
+    if len(r_idx) == 0 or len(c_idx) == 0:
+        return None
+    top, bottom = int(r_idx[0]), int(r_idx[-1])
+    left, right = int(c_idx[0]), int(c_idx[-1])
+    if (bottom - top) < 0.15 * h or (right - left) < 0.15 * w:
+        return None
+    return left, top, right + 1, bottom + 1
+
+
+def _trim_bright(work):
+    """Weisse Raender um den Inhalt wegschneiden."""
+    bbox = _content_bbox(work)
     if not bbox:
         return work
-
-    pad_x = int((bbox[2] - bbox[0]) * 0.015)
-    pad_y = int((bbox[3] - bbox[1]) * 0.015)
+    pad_x = max(4, int((bbox[2] - bbox[0]) * 0.02))
+    pad_y = max(4, int((bbox[3] - bbox[1]) * 0.02))
     left = max(0, bbox[0] - pad_x)
     top = max(0, bbox[1] - pad_y)
     right = min(work.width, bbox[2] + pad_x)
@@ -160,8 +368,17 @@ def _trim(work):
     return work.crop((left, top, right, bottom))
 
 
+def _unused_old_deskew_removed():
+    pass
+
+
+# alte API beibehalten
+def crop_white_borders(img):
+    return _extract_page(img)
+
+
 def to_a4(img, margin_mm=MARGIN_MM, dpi=DPI):
-    """Setzt das Bild mittig auf eine weisse A4-Seite (Querformat bei Querformat-Bild)."""
+    """Setzt das Bild mittig auf eine weisse A4-Seite (Querformat bei Querformat)."""
     landscape = img.width > img.height * 1.05
     page_mm = A4_LANDSCAPE_MM if landscape else A4_PORTRAIT_MM
     page_w, page_h = _mm2px(page_mm[0], dpi), _mm2px(page_mm[1], dpi)
@@ -179,17 +396,16 @@ def to_a4(img, margin_mm=MARGIN_MM, dpi=DPI):
 
 
 def images_to_pdf(images, out_path, dpi=DPI):
-    """Mehrere A4-Seiten in ein PDF schreiben (JPEG, Qualitaet 90)."""
-    pages = [to_a4(crop_white_borders(im), dpi=dpi) for im in images]
+    """Mehrere A4-Seiten in ein PDF schreiben."""
+    pages = [to_a4(_extract_page(im), dpi=dpi) for im in images]
     if not pages:
         raise ValueError("keine Bilder")
-    w_pt = pages[0].width / dpi * 72
-    h_pt = pages[0].height / dpi * 72
-    c = canvas.Canvas(str(out_path), pagesize=(w_pt, h_pt))
+    c = canvas.Canvas(str(out_path), pagesize=(595.2, 841.9))
     for p in pages:
         c.setPageSize((p.width / dpi * 72, p.height / dpi * 72))
         buf = io.BytesIO()
-        p.save(buf, format="JPEG", quality=90, optimize=True)
+        # verlustfrei in die Zwischen-PDF: bessere OCR, ocrmypdf komprimiert danach
+        p.save(buf, format="PNG", optimize=True)
         buf.seek(0)
         c.drawImage(ImageReader(buf), 0, 0, width=p.width / dpi * 72,
                     height=p.height / dpi * 72)
@@ -206,9 +422,54 @@ def ocr_pdf(in_path, out_path, container=OCR_CONTAINER, lang=OCR_LANG):
     cmd = ["docker", "exec", container, "ocrmypdf", "-l", lang,
            "--deskew", "--optimize", "1", "--output-type", "pdf",
            rel_in, rel_out]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if res.returncode != 0 or not out_path.exists():
         return False, (res.stderr or res.stdout or "ocr failed")[-1500:]
+    return True, "ok"
+
+
+def _docker(job_id, args, timeout=900):
+    """Kommando im OCR-Container ausfuehren (Pfade unter /work/<job_id>)."""
+    cmd = ["docker", "exec", OCR_CONTAINER] + [str(a) for a in args]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _ocr_page_pdf(job_id, png_name, page):
+    """Eine Seite OCRen: Tesseract schreibt PDF mit unsichtbarem Textlayer."""
+    base = png_name.rsplit(".", 1)[0]
+    res = _docker(job_id, ["tesseract", f"/work/{job_id}/{png_name}",
+                           f"/work/{job_id}/{base}", "-l", OCR_LANG, "--psm", "6", "pdf"])
+    if res.returncode != 0:
+        return None, (res.stderr or res.stdout or "tesseract fehlgeschlagen")[-1200:]
+    return page / f"{base}.pdf", "ok"
+
+
+def _merge_pdfs(parts, out_path):
+    """Teil-PDFs zu einem Dokument zusammenfassen (PyMuPDF)."""
+    import pymupdf
+    doc = pymupdf.open()
+    for part in parts:
+        with pymupdf.open(str(part)) as d:
+            doc.insert_pdf(d)
+    doc.set_metadata({"producer": "Scan2PDF", "creator": "Scan2PDF"})
+    doc.save(str(out_path), garbage=3, deflate=True)
+    doc.close()
+
+
+def _compress(job_id, in_name, out_name, dpi=200):
+    """PDF verkleinern (Bilder als JPEG), Textlayer bleibt erhalten."""
+    res = _docker(job_id, [
+        "gs", "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite",
+        "-dPDFSETTINGS=/prepress",
+        "-dAutoFilterColorImages=false", "-dColorImageFilter=/DCTEncode",
+        "-dColorImageDownsampleType=/Bicubic", f"-dColorImageResolution={dpi}",
+        "-dAutoFilterGrayImages=false", "-dGrayImageFilter=/DCTEncode",
+        "-dGrayImageDownsampleType=/Bicubic", f"-dGrayImageResolution={dpi}",
+        "-dJPEGQ=85", "-dEmbedAllFonts=true", "-dSubsetFonts=true",
+        f"-sOutputFile=/work/{job_id}/{out_name}", f"/work/{job_id}/{in_name}"],
+        timeout=600)
+    if res.returncode != 0:
+        return False, (res.stderr or "ghostscript fehlgeschlagen")[-800:]
     return True, "ok"
 
 
@@ -219,22 +480,39 @@ def process_job(images, work_root, out_dir, do_ocr=True):
     job_dir.mkdir(parents=True, exist_ok=True)
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    raw = job_dir / "raw.pdf"
-    pages = images_to_pdf(images, raw)
+    pages = [to_a4(_extract_page(im)) for im in images]
+    if not pages:
+        raise ValueError("keine Bilder")
 
-    ocr_ok, ocr_msg = (False, "deaktiviert")
-    text = ""
+    ocr_ok, ocr_msg, text = False, "deaktiviert", ""
     if do_ocr:
-        ocr_out = job_dir / "ocr.pdf"
-        ocr_ok, ocr_msg = ocr_pdf(raw, ocr_out)
-        if ocr_ok:
-            text = pdf_text(ocr_out)
-            raw.unlink(missing_ok=True)
-            src = ocr_out
+        parts, errors = [], []
+        for idx, page in enumerate(pages):
+            png = f"p{idx}.png"
+            page.save(job_dir / png, dpi=(DPI, DPI))
+            part, msg = _ocr_page_pdf(job_id, png, job_dir)
+            if part is None:
+                errors.append(msg)
+                ocr_ok = False
+                break
+            parts.append(part)
+        if parts:
+            merged = job_dir / "merged.pdf"
+            _merge_pdfs(parts, merged)
+            small = job_dir / "final.pdf"
+            ok, msg = _compress(job_id, "merged.pdf", "final.pdf")
+            src = small if ok else merged
+            text = pdf_text(src, max_chars=4000)
+            ocr_ok, ocr_msg = True, "ok"
         else:
-            src = raw
+            ocr_msg = errors[-1] if errors else "ocr fehlgeschlagen"
+            fallback = job_dir / "raw.pdf"
+            images_to_pdf(images, fallback)
+            src = fallback
     else:
-        src = raw
+        fallback = job_dir / "raw.pdf"
+        images_to_pdf(images, fallback)
+        src = fallback
 
     final = Path(out_dir) / f"scan-{job_id}.pdf"
     os.replace(src, final)
@@ -248,7 +526,7 @@ def process_job(images, work_root, out_dir, do_ocr=True):
     return {
         "id": job_id,
         "file": final.name,
-        "pages": pages,
+        "pages": len(pages),
         "size_kb": round(final.stat().st_size / 1024),
         "ocr": ocr_ok,
         "ocr_msg": ocr_msg,
@@ -257,7 +535,7 @@ def process_job(images, work_root, out_dir, do_ocr=True):
 
 
 def pdf_text(path, max_chars=1500):
-    """Text aus dem OCR-PDF lesen (PyMuPDF falls vorhanden, sonst pdftotext im Container)."""
+    """Text aus dem OCR-PDF lesen (PyMuPDF, sonst pdftotext im Container)."""
     try:
         import pymupdf  # type: ignore
         doc = pymupdf.open(str(path))
