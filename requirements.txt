@@ -1,0 +1,5 @@
+flask>=3.0
+pillow>=11.0
+numpy>=1.26
+reportlab>=4.0
+pymupdf>=1.24
