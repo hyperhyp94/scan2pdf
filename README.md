@@ -53,3 +53,16 @@ journalctl --user -u tool-scan2pdf -f     # Logs
 | `GET /download/<datei>` | PDF herunterladen |
 | `POST /api/paperless/<datei>` | Kopie in `/mnt/ssd/paperless-consume` |
 | `GET /health` | Health-Check |
+
+## Chat-Weg (ohne Browser)
+
+Bilder, die im Chat ankommen, landen in `~/.hermes/image_cache`. Von dort direkt verarbeiten:
+
+```bash
+./venv/bin/python scripts/scan_cli.py --latest 2          # 2 neueste Chat-Bilder
+./venv/bin/python scripts/scan_cli.py bild1.jpg bild2.jpg # explizite Dateien
+./venv/bin/python scripts/scan_cli.py --latest 1 --no-ocr
+```
+
+Gibt JSON mit `path` (fertiges PDF), `pages`, `ocr`, `text` aus.
+
