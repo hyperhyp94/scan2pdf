@@ -11,7 +11,10 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template_string, request, send_from_directory
 from PIL import Image
 
+import ipaddress
+
 import pipeline
+import webui_chat
 
 BASE = Path(__file__).resolve().parent
 WORK = BASE / "work"
@@ -487,6 +490,48 @@ def api_paperless(name):
 @app.route("/api/folders")
 def api_folders():
     return jsonify(_folders())
+
+
+def _internal_request():
+    """Nur Host und Docker-Netze (Paperless-Container) duerfen den Chat-Hook aufrufen."""
+    try:
+        ip = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return False
+    return ip.is_loopback or ip in ipaddress.ip_network("172.16.0.0/12")
+
+
+@app.route("/api/chat-hook", methods=["POST"])
+def api_chat_hook():
+    """Paperless-Prozessor meldet ein 'antworten'-Dokument -> neuer Chat im Hermes-WebUI."""
+    if not _internal_request():
+        return jsonify(error="nicht erlaubt"), 403
+    d = request.get_json(silent=True) or {}
+    doc_id = str(d.get("document_id") or "").strip()
+    if not doc_id.isdigit():
+        return jsonify(error="document_id fehlt"), 400
+    title = (d.get("title") or "Dokument").strip()
+    lines = [f"📄 Neues Dokument zur Bearbeitung (Paperless-ID {doc_id})", "",
+             f"Titel: {title}"]
+    for key, label in (("correspondent", "Von"), ("document_type", "Typ"), ("deadline", "Frist")):
+        if d.get(key):
+            lines.append(f"{label}: {d[key]}")
+    if d.get("tags"):
+        lines.append("Tags: " + ", ".join(map(str, d["tags"])))
+    if d.get("action_required"):
+        lines.append("⚠️ Aktion erforderlich")
+    if d.get("summary"):
+        lines += ["", "Zusammenfassung:", str(d["summary"])[:1500]]
+    if d.get("proaktiv"):
+        lines += ["", str(d["proaktiv"])[:1000]]
+    lines += ["", "Lies das Dokument bei Bedarf über Paperless (ID oben), fasse kurz zusammen "
+                  "und frag mich, was ich damit tun soll (z. B. Antwort entwerfen, Termin eintragen, "
+                  "nur ablegen). Entwürfe nur zeigen, nie senden."]
+    try:
+        sid, url = webui_chat.create_chat(f"📄 {title}"[:80], "\n".join(lines))
+    except Exception as exc:
+        return jsonify(error=str(exc)), 502
+    return jsonify(ok=True, session_id=sid, url=url)
 
 
 @app.route("/health")
