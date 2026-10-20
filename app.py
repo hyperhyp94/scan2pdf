@@ -46,7 +46,27 @@ def _add_meta(entry):
     _save_meta(items)
 
 
-def _consume_name(label, fallback):
+MODI = ("archivieren", "antworten")
+
+
+def _folders():
+    """Vorhandene Unterordner (= Ordner-Tags), wie bei Nextcloud."""
+    base = PAPERLESS_CONSUME / "archivieren"
+    try:
+        return sorted(d.name for d in base.iterdir() if d.is_dir() and not d.name.startswith((".", "_")))
+    except OSError:
+        return []
+
+
+def _target_dir(modus="archivieren", ordner=""):
+    modus = modus if modus in MODI else "archivieren"
+    d = PAPERLESS_CONSUME / modus
+    if ordner and ordner in _folders():          # nur existierende Ordner, kein Path-Traversal
+        d = d / ordner
+    return d
+
+
+def _consume_name(label, fallback, folder=None):
     """Dateiname fuer Paperless. 'Titel (tag1,tag2)' -> 'Titel (tag1,tag2).pdf' —
     der Paperless-Tagger liest die Klammer am Ende als Tags (wie bei den Nextcloud-Ordnern)."""
     label = re.sub(r'[\\/:*?"<>|\x00-\x1f]', " ", (label or "")).strip()
@@ -58,15 +78,17 @@ def _consume_name(label, fallback):
     tags = ",".join(t.strip() for t in m.group(1).split(",") if t.strip()) if m else ""
     base = f"{title} ({tags})" if tags else title
     name, n = f"{base}.pdf", 2
-    while (PAPERLESS_CONSUME / name).exists():          # Kollision: Zaehler VOR der Klammer
+    folder = folder or PAPERLESS_CONSUME
+    while (folder / name).exists():          # Kollision: Zaehler VOR der Klammer
         name = (f"{title} {n} ({tags}).pdf" if tags else f"{title} {n}.pdf")
         n += 1
     return name
 
 
-def _to_paperless(src, label=""):
-    PAPERLESS_CONSUME.mkdir(parents=True, exist_ok=True)
-    dst = PAPERLESS_CONSUME / _consume_name(label, src.name)
+def _to_paperless(src, label="", modus="archivieren", ordner=""):
+    folder = _target_dir(modus, ordner)
+    folder.mkdir(parents=True, exist_ok=True)
+    dst = folder / _consume_name(label, src.name, folder)
     shutil.copy2(src, dst)
     return dst
 
@@ -172,6 +194,10 @@ PAGE = r"""<!DOCTYPE html>
     <input type="checkbox" id="pl">
     <label for="pl">direkt nach Paperless (Tags aus der Klammer)</label>
   </div>
+  <div class="row" style="gap:8px">
+    <select id="modus" style="flex:1;padding:12px;font-size:15px;border-radius:10px;border:1px solid #2a2f3a;background:var(--card);color:inherit"><option value="archivieren">📁 archivieren</option><option value="antworten">✉️ antworten</option></select>
+    <select id="ordner" style="flex:1;padding:12px;font-size:15px;border-radius:10px;border:1px solid #2a2f3a;background:var(--card);color:inherit"><option value="">(kein Ordner)</option></select>
+  </div>
   <div class="row">
     <input type="checkbox" id="ocr" checked>
     <label for="ocr">OCR (durchsuchbares PDF, deutsch)</label>
@@ -213,6 +239,8 @@ function addFiles(list) {
   render();
 }
 
+fetch('/api/folders').then(r => r.json()).then(list => list.forEach(n => {
+  const o = document.createElement('option'); o.value = o.textContent = n; $('ordner').appendChild(o); }));
 $('pick').onclick = () => $('file').click();
 $('camera').onclick = () => $('cam').click();
 drop.onclick = () => $('file').click();
@@ -239,6 +267,8 @@ $('go').onclick = async () => {
   fd.append('ocr', $('ocr').checked ? '1' : '0');
   fd.append('label', $('label').value);
   fd.append('paperless', $('pl').checked ? '1' : '0');
+  fd.append('modus', $('modus').value);
+  fd.append('ordner', $('ordner').value);
   $('go').disabled = true;
   $('status').innerHTML = '<span class="spinner"></span>Wird verarbeitet … (OCR dauert ein paar Sekunden pro Seite)';
   try {
@@ -290,7 +320,8 @@ $('results').onclick = async (e) => {
   if (!b) return;
   b.disabled = true; b.textContent = '…';
   try {
-    const r = await fetch('/api/paperless/' + encodeURIComponent(b.dataset.pl), { method: 'POST' });
+    const r = await fetch('/api/paperless/' + encodeURIComponent(b.dataset.pl) + '?modus=' + $('modus').value +
+      '&ordner=' + encodeURIComponent($('ordner').value), { method: 'POST' });
     const j = await r.json();
     b.textContent = r.ok ? '✅ übergeben' : '❌ ' + (j.error || 'Fehler');
   } catch (err) {
@@ -334,12 +365,19 @@ KAMERA_PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
   input[type=file] { display:none; }
   #label { width:100%; max-width:420px; padding:14px; margin-bottom:10px; font-size:17px; border-radius:12px;
            border:1px solid #2a2f3a; background:var(--card); color:var(--txt); }
+  .sel { display:flex; gap:8px; width:100%; max-width:420px; margin-bottom:10px; }
+  .sel select { flex:1; min-width:0; padding:12px; font-size:15px; border-radius:12px; border:1px solid #2a2f3a;
+                background:var(--card); color:var(--txt); }
   .chk { display:flex; gap:8px; align-items:center; margin-bottom:16px; color:#8b93a7; font-size:15px; }
   .chk input { width:20px; height:20px; }
 </style></head><body>
   <h1>📷 Scan2PDF</h1>
   <div class="sub">Tippen → Foto machen → PDF wird automatisch erstellt (OCR, A4)</div>
   <input type="text" id="label" placeholder="Titel (tag1,tag2,tag3)" autocomplete="off" autocapitalize="off">
+  <div class="sel">
+    <select id="modus"><option value="archivieren">📁 archivieren</option><option value="antworten">✉️ antworten (Antwort nötig)</option></select>
+    <select id="ordner"><option value="">(kein Ordner)</option></select>
+  </div>
   <label class="chk"><input type="checkbox" id="pl" checked> direkt nach Paperless</label>
   <input type="file" id="cam" accept="image/*" capture="environment">
   <button class="cam" id="btn">Foto aufnehmen</button>
@@ -348,6 +386,12 @@ KAMERA_PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
 <script>
 const $ = (id) => document.getElementById(id);
 $('btn').onclick = () => $('cam').click();
+['modus', 'ordner'].forEach(k => { const v = localStorage.getItem('s2p_' + k); if (v) $(k).value = v; });
+fetch('/api/folders').then(r => r.json()).then(list => {
+  list.forEach(n => { const o = document.createElement('option'); o.value = o.textContent = n; $('ordner').appendChild(o); });
+  const v = localStorage.getItem('s2p_ordner'); if (v) $('ordner').value = v;
+});
+['modus', 'ordner'].forEach(k => $(k).onchange = () => localStorage.setItem('s2p_' + k, $(k).value));
 $('cam').onchange = async (e) => {
   const f = e.target.files[0];
   e.target.value = '';
@@ -357,6 +401,8 @@ $('cam').onchange = async (e) => {
   fd.append('ocr', '1');
   fd.append('label', $('label').value);
   fd.append('paperless', $('pl').checked ? '1' : '0');
+  fd.append('modus', $('modus').value);
+  fd.append('ordner', $('ordner').value);
   $('btn').disabled = true;
   $('status').innerHTML = '<span class="spinner"></span>Foto wird zu PDF verarbeitet …';
   try {
@@ -402,8 +448,9 @@ def api_process():
     result["label"] = (request.form.get("label") or "").strip()
     if request.form.get("paperless") == "1":
         try:
-            dst = _to_paperless(OUT / result["file"], result["label"])
-            result["paperless"] = dst.name
+            dst = _to_paperless(OUT / result["file"], result["label"],
+                                request.form.get("modus", "archivieren"), request.form.get("ordner", ""))
+            result["paperless"] = f"{dst.parent.relative_to(PAPERLESS_CONSUME)}/{dst.name}"
         except Exception as exc:
             result["paperless_error"] = str(exc)
     _add_meta(result)
@@ -430,10 +477,16 @@ def api_paperless(name):
     label = request.args.get("label") or next(
         (i.get("label", "") for i in _load_meta() if i.get("file") == name), "")
     try:
-        dst = _to_paperless(src, label)
+        dst = _to_paperless(src, label, request.args.get("modus", "archivieren"),
+                            request.args.get("ordner", ""))
     except Exception as exc:
         return jsonify(error=str(exc)), 500
-    return jsonify(ok=True, target=dst.name)
+    return jsonify(ok=True, target=f"{dst.parent.relative_to(PAPERLESS_CONSUME)}/{dst.name}")
+
+
+@app.route("/api/folders")
+def api_folders():
+    return jsonify(_folders())
 
 
 @app.route("/health")
