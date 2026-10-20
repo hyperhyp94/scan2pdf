@@ -126,6 +126,18 @@ def _whiteout_background(img):
     return Image.fromarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
 
 
+def _whiteout_border(img, frac=0.035):
+    """Whiteout NUR im aeusseren Randstreifen (Holzreste), Innenflaeche/Text bleibt unberuehrt."""
+    out = _whiteout_background(img)
+    if out is img:
+        return img
+    a, b = np.asarray(img.convert("RGB")).copy(), np.asarray(out.convert("RGB"))
+    h, w = a.shape[:2]
+    d = max(4, int(min(h, w) * frac))
+    a[:d], a[-d:], a[:, :d], a[:, -d:] = b[:d], b[-d:], b[:, :d], b[:, -d:]
+    return Image.fromarray(a)
+
+
 def _mask_polygon(img, bgr=None):
     """Papierflaeche als gefuellte Maske (Blattform, kein Viereck-Zwang)."""
     if bgr is None:
@@ -226,6 +238,82 @@ def _find_quad(bgr, min_area=0.30):
     return np.clip(corners, [0, 0], [w - 1, h - 1]).astype(np.float32)
 
 
+def _edge_contrast(small, quad, band=0.012):
+    """Pro Viereckskante: Median(innen heller + farbneutraler als aussen).
+
+    Echte Blattkanten -> klar positiv (Papier heller als Untergrund). Vierecke am
+    Bildrand oder quer ueber Holzmaserung -> ~0 oder negativ. -1 = Kante liegt am Bildrand.
+    """
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h, w = small.shape[:2]
+    d = max(4, int(min(h, w) * band))
+    q = _order_quad(quad)
+    c = q.mean(axis=0)
+    vals = []
+    for i in range(4):
+        a, b = q[i], q[(i + 1) % 4]
+        n = max(10, int(np.linalg.norm(b - a) / 6))
+        t = np.linspace(0.1, 0.9, n)
+        pts = a[None, :] * (1 - t[:, None]) + b[None, :] * t[:, None]
+        vec = pts - c
+        vec /= (np.linalg.norm(vec, axis=1, keepdims=True) + 1e-6)
+        pin = (pts - vec * d).astype(int)
+        pout = (pts + vec * d).astype(int)
+        ok = (pout[:, 0] >= 0) & (pout[:, 0] < w) & (pout[:, 1] >= 0) & (pout[:, 1] < h)
+        if ok.sum() < n * 0.7:
+            vals.append(-1.0)
+            continue
+        pin, pout = pin[ok], pout[ok]
+        vin, vout = hsv[pin[:, 1], pin[:, 0]], hsv[pout[:, 1], pout[:, 0]]
+        vals.append(float(np.median((vin[:, 2] - vout[:, 2]) + 0.6 * (vout[:, 1] - vin[:, 1]))))
+    return vals
+
+
+def _find_quad_edges(bgr, min_area=0.15, max_area=0.98, min_contrast=30.0):
+    """Blatt per KANTEN finden (Canny -> Vierecke -> Kantenkontrast pruefen).
+
+    Unabhaengig von der Untergrundfarbe (auch helles Holz/Parkett). Gewinner = groesstes
+    Viereck, dessen vier Kanten alle klar Papier-gegen-Untergrund sind.
+    """
+    h, w = bgr.shape[:2]
+    scale = min(1.0, 1000.0 / max(h, w))
+    small = cv2.resize(bgr, (int(w * scale), int(h * scale)),
+                       interpolation=cv2.INTER_AREA) if scale < 1 else bgr
+    sh, sw = small.shape[:2]
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    best, best_score = None, 0.0
+    for blur in (5, 9):
+        g = cv2.GaussianBlur(gray, (blur, blur), 0)
+        for lo, hi in ((20, 60), (40, 120), (60, 180)):
+            e = cv2.Canny(g, lo, hi)
+            e = cv2.dilate(e, np.ones((3, 3), np.uint8), iterations=2)
+            e = cv2.morphologyEx(e, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+            for c in cv2.findContours(e, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[-2]:
+                if not (min_area <= cv2.contourArea(c) / (sh * sw) <= max_area):
+                    continue
+                hull = cv2.convexHull(c)
+                peri = cv2.arcLength(hull, True)
+                for eps in (0.02, 0.03, 0.04, 0.06):
+                    ap = cv2.approxPolyDP(hull, eps * peri, True)
+                    if len(ap) != 4:
+                        continue
+                    quad = ap.reshape(4, 2).astype(np.float32)
+                    ec = _edge_contrast(small, quad)
+                    if min(ec) < min_contrast:
+                        break
+                    area = cv2.contourArea(quad) / (sh * sw)
+                    score = area * min(1.0, min(ec) / 80.0)
+                    if score > best_score:
+                        best, best_score = quad, score
+                    break
+    if best is None:
+        return None
+    corners = np.array(_order_quad(best / scale), dtype=np.float32)
+    center = corners.mean(axis=0)
+    corners = center + (corners - center) * 0.996
+    return np.clip(corners, [0, 0], [w - 1, h - 1]).astype(np.float32)
+
+
 def _warp_quad(bgr, quad):
     """Perspektivisch entzerren: Viereck -> Rechteck."""
     tl, tr, br, bl = quad
@@ -257,12 +345,20 @@ def _extract_page(img):
         return img
 
     occ, ratio = _page_occupancy(img, bgr)
+    # 1) Bestfall: Blatt komplett sichtbar -> per KANTEN finden (farbunabhaengig,
+    #    klappt auch auf hellem Holz), Fallback: Farbmaske (hell + farbneutral)
+    work = None
+    quad = _find_quad_edges(bgr)
+    if quad is None:
+        quad = _find_quad(bgr)
+    else:
+        # Belegung/Seitenverhaeltnis aus dem Kanten-Viereck statt aus der Farbmaske
+        qw = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2
+        qh = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2
+        occ = cv2.contourArea(quad) / float(bgr.shape[0] * bgr.shape[1])
+        ratio = (qw / qh) if qh else 1.0
     # Blatt fast komplett im Bild -> ganze Seite behalten (Original-Layout!)
     full_page = occ >= 0.45 and (0.55 <= ratio <= 0.88 or 1.13 <= ratio <= 1.60)
-
-    # 1) Bestfall: Blatt komplett sichtbar -> perspektivisch entzerren
-    work = None
-    quad = _find_quad(bgr)
     if quad is not None:
         work = _warp_quad(bgr, quad)
 
@@ -284,7 +380,10 @@ def _extract_page(img):
         work = img
 
     work = _straighten(work)
-    work = _whiteout_background(work)   # Rest-Untergrund (Holz) entfernen
+    # Rest-Untergrund (Holz): bei sauberem Viereck-Zuschnitt nur im Randstreifen weissmalen,
+    # sonst frisst der Schritt dunklen/farbigen Text und Unterschriften.
+    cut_clean = quad is not None
+    work = _whiteout_border(work) if cut_clean else _whiteout_background(work)
     work = _flatten_illumination(work)  # Schatten weg -> weisses Papier, harter Text
 
     if not full_page:                   # kleines Blatt -> auf den Inhalt zuschneiden
@@ -294,7 +393,7 @@ def _extract_page(img):
     else:
         # nur die beim Drehen entstandenen weissen Ecken abschneiden
         work = _trim_white_edges(work)
-    work = _whiteout_background(work)
+    work = _whiteout_border(work) if cut_clean else _whiteout_background(work)
     return work
 
 
