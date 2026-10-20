@@ -5,3 +5,5 @@ work/
 data/out/
 data/results.json
 .DS_Store
+data/scans/
+work/

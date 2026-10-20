@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request, send_from_directory
@@ -385,7 +386,7 @@ KAMERA_PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
   <input type="file" id="cam" accept="image/*" capture="environment">
   <button class="cam" id="btn">Foto aufnehmen</button>
   <div class="status" id="status"></div>
-  <div class="nav"><a href="/">Zur Vollansicht (Mehrere Fotos, Paperless)</a></div>
+  <div class="nav"><a href="/scan">📄 Scan-Modus (mehrere Seiten, Rand korrigieren)</a> · <a href="/">Vollansicht</a></div>
 <script>
 const $ = (id) => document.getElementById(id);
 $('btn').onclick = () => $('cam').click();
@@ -532,6 +533,381 @@ def api_chat_hook():
     except Exception as exc:
         return jsonify(error=str(exc)), 502
     return jsonify(ok=True, session_id=sid, url=url)
+
+
+# ───────────────────────── Scan-Modus (Seite für Seite, Ränder korrigierbar) ─────────────────────────
+SCANS = BASE / "data" / "scans"          # data/scans/<sid>/{meta.json, <pid>.src.jpg, <pid>.page.png}
+SCANS.mkdir(parents=True, exist_ok=True)
+_SID = re.compile(r"^[0-9a-f]{12}$")
+SCAN_TTL = 3 * 86400
+
+
+def _scan_dir(sid, create=False):
+    if not _SID.match(sid or ""):
+        return None
+    d = SCANS / sid
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d if d.is_dir() else None
+
+
+def _scan_meta(d):
+    f = d / "meta.json"
+    return json.loads(f.read_text()) if f.exists() else {"pages": []}
+
+
+def _scan_save(d, meta):
+    (d / "meta.json").write_text(json.dumps(meta))
+
+
+def _scan_cleanup():
+    now = time.time()
+    for d in SCANS.iterdir():
+        if d.is_dir() and now - d.stat().st_mtime > SCAN_TTL:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _page_public(sid, pg):
+    return {"id": pg["id"], "quad": pg["quad"], "auto": pg.get("auto", False),
+            "src": f"/api/scan/{sid}/img/{pg['id']}.src.jpg",
+            "thumb": f"/api/scan/{sid}/img/{pg['id']}.page.jpg?v={pg.get('rev', 0)}"}
+
+
+def _render_page(d, pg):
+    """Zuschnitt aus Original + Ecken neu berechnen -> A4-Seite (PNG fuer OCR, JPG-Vorschau)."""
+    frame = Image.open(d / f"{pg['id']}.src.jpg").convert("RGB")
+    page = pipeline.to_a4(pipeline.extract_with_quad(frame, pg["quad"]))
+    page.save(d / f"{pg['id']}.page.png", dpi=(pipeline.DPI, pipeline.DPI))
+    prev = page.copy()
+    prev.thumbnail((700, 990))
+    prev.save(d / f"{pg['id']}.page.jpg", quality=80)
+    pg["rev"] = pg.get("rev", 0) + 1
+
+
+SCAN_PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Scan2PDF Scan</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --acc:#4f8cff; --txt:#e8eaf0; --mut:#8b93a7; --ok:#3ccf7a; --err:#ff6b6b; --line:#2a2f3a; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--txt); padding:16px 14px 120px; }
+  h1 { font-size:20px; margin:4px 0 2px; } .sub { color:var(--mut); font-size:13px; margin-bottom:14px; }
+  .btn { padding:15px 16px; border:0; border-radius:14px; font-size:17px; font-weight:600; background:var(--card); color:var(--txt);
+         border:1px solid var(--line); cursor:pointer; }
+  .btn.p { background:var(--acc); border-color:var(--acc); color:#fff; } .btn:disabled { opacity:.45; }
+  .row { display:flex; gap:8px; margin:10px 0; } .row > * { flex:1; min-width:0; }
+  input[type=text], select { width:100%; padding:13px; font-size:16px; border-radius:12px; border:1px solid var(--line);
+         background:var(--card); color:var(--txt); }
+  .chk { display:flex; gap:8px; align-items:center; color:var(--mut); font-size:15px; margin:8px 0; } .chk input { width:20px; height:20px; }
+  .pages { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:10px; margin:14px 0; }
+  .pg { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:6px; position:relative; }
+  .pg img { width:100%; display:block; border-radius:6px; background:#fff; aspect-ratio:210/297; object-fit:contain; }
+  .pg .n { position:absolute; left:10px; top:10px; background:#000a; border-radius:8px; padding:1px 8px; font-size:13px; }
+  .pg .badge { font-size:11px; color:var(--mut); margin:4px 2px 0; } .badge.warn { color:#ffb454; }
+  .pg .acts { display:flex; gap:5px; margin-top:6px; } .pg .acts button { flex:1; padding:8px 0; font-size:14px; border-radius:9px; border:1px solid var(--line); background:#0f1115; color:var(--txt); }
+  .status { min-height:22px; margin:8px 0; font-size:15px; } .ok { color:var(--ok); } .err { color:var(--err); }
+  .bar { position:fixed; left:0; right:0; bottom:0; padding:10px 14px calc(10px + env(safe-area-inset-bottom)); background:#0f1115ee;
+         border-top:1px solid var(--line); display:flex; gap:8px; backdrop-filter:blur(8px); }
+  .bar .btn { flex:1; padding:16px 6px; }
+  /* Rand-Editor */
+  #ed { position:fixed; inset:0; background:#000; z-index:20; display:none; flex-direction:column; }
+  #ed .top { padding:10px 12px; display:flex; gap:8px; align-items:center; font-size:14px; color:var(--mut); }
+  #edwrap { flex:1; position:relative; overflow:hidden; touch-action:none; }
+  #edimg { position:absolute; left:0; top:0; user-select:none; -webkit-user-drag:none; }
+  #edsvg { position:absolute; left:0; top:0; }
+  #ed .bot { padding:10px 12px calc(10px + env(safe-area-inset-bottom)); display:flex; gap:8px; }
+  .spinner { display:inline-block; width:15px; height:15px; border:2px solid #555; border-top-color:var(--acc); border-radius:50%;
+             animation:s 1s linear infinite; vertical-align:-3px; margin-right:8px; } @keyframes s { to { transform:rotate(360deg); } }
+  a { color:var(--acc); } input[type=file] { display:none; }
+</style></head><body>
+<h1>📄 Scan</h1>
+<div class="sub">Seite fotografieren → Rand prüfen → nächste Seite → PDF erstellen</div>
+<input type="text" id="label" placeholder="Titel (tag1,tag2,tag3)" autocomplete="off" autocapitalize="off">
+<div class="row">
+  <select id="modus"><option value="archivieren">📁 archivieren</option><option value="antworten">✉️ antworten</option></select>
+  <select id="ordner"><option value="">(kein Ordner)</option></select>
+</div>
+<label class="chk"><input type="checkbox" id="pl" checked> direkt nach Paperless</label>
+<div class="status" id="status"></div>
+<div class="pages" id="pages"></div>
+<input type="file" id="cam" accept="image/*" capture="environment">
+<input type="file" id="gal" accept="image/*" multiple>
+<div style="margin-top:20px;font-size:13px;color:var(--mut)"><a href="/kamera">Schnell-Kamera (1 Foto)</a> · <a href="/">Vollansicht</a></div>
+<div class="bar">
+  <button class="btn p" id="add">📷 Seite</button>
+  <button class="btn" id="pick">🖼 Galerie</button>
+  <button class="btn p" id="fin" disabled>✅ PDF</button>
+</div>
+
+<div id="ed">
+  <div class="top"><span id="edinfo">Ecken mit dem Finger ziehen</span></div>
+  <div id="edwrap"><img id="edimg" alt=""><svg id="edsvg"></svg></div>
+  <div class="bot">
+    <button class="btn" id="edall">Ganzes Bild</button>
+    <button class="btn" id="edcancel">Abbrechen</button>
+    <button class="btn p" id="edok">Übernehmen</button>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let sid = sessionStorage.getItem('s2p_sid'), pages = [];
+const KEYS = ['label', 'modus', 'ordner'];
+KEYS.forEach(k => { const v = localStorage.getItem('s2p_' + k); if (v !== null && k !== 'label') $(k).value = v; });
+KEYS.filter(k => k !== 'label').forEach(k => $(k).onchange = () => localStorage.setItem('s2p_' + k, $(k).value));
+fetch('/api/folders').then(r => r.json()).then(l => { l.forEach(n => { const o = document.createElement('option'); o.value = o.textContent = n; $('ordner').appendChild(o); });
+  const v = localStorage.getItem('s2p_ordner'); if (v) $('ordner').value = v; });
+
+function msg(h, cls) { $('status').className = 'status ' + (cls || ''); $('status').innerHTML = h || ''; }
+async function ensure() {
+  if (sid) { const r = await fetch('/api/scan/' + sid); if (r.ok) { pages = (await r.json()).pages; render(); return; } }
+  const r = await fetch('/api/scan/new', { method: 'POST' }); sid = (await r.json()).sid; sessionStorage.setItem('s2p_sid', sid); pages = []; render();
+}
+function render() {
+  const box = $('pages'); box.innerHTML = '';
+  pages.forEach((p, i) => {
+    const d = document.createElement('div'); d.className = 'pg';
+    d.innerHTML = `<img src="${p.thumb}" alt=""><span class="n">${i + 1}</span>
+      <div class="badge ${p.auto ? '' : 'warn'}">${p.auto ? 'Rand automatisch' : 'Rand manuell / prüfen'}</div>
+      <div class="acts"><button data-a="edit" data-i="${i}">✂️</button><button data-a="up" data-i="${i}">◀</button>
+      <button data-a="down" data-i="${i}">▶</button><button data-a="del" data-i="${i}">🗑</button></div>`;
+    box.appendChild(d);
+  });
+  $('fin').disabled = pages.length === 0; $('fin').textContent = pages.length ? `✅ PDF (${pages.length})` : '✅ PDF';
+}
+$('pages').onclick = async (e) => {
+  const b = e.target.closest('button[data-a]'); if (!b) return;
+  const p = pages[+b.dataset.i], a = b.dataset.a;
+  if (a === 'edit') return openEditor(p);
+  const url = a === 'del' ? `/api/scan/${sid}/delete/${p.id}` : `/api/scan/${sid}/move/${p.id}`;
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dir: a }) });
+  if (r.ok) { pages = (await r.json()).pages; render(); }
+};
+async function upload(files) {
+  await ensure();
+  for (const f of files) {
+    msg(`<span class="spinner"></span>Seite ${pages.length + 1} wird erkannt …`);
+    const fd = new FormData(); fd.append('file', f);
+    try {
+      const r = await fetch(`/api/scan/${sid}/add`, { method: 'POST', body: fd }); const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.status);
+      pages.push(j.page); render();
+      msg(j.page.auto ? '✅ Rand erkannt — bei Bedarf ✂️ antippen.' : '⚠️ Rand nicht sicher erkannt — bitte mit ✂️ prüfen.', j.page.auto ? 'ok' : '');
+    } catch (err) { msg('❌ ' + err.message, 'err'); }
+  }
+}
+$('add').onclick = () => $('cam').click(); $('pick').onclick = () => $('gal').click();
+$('cam').onchange = (e) => { const f = [...e.target.files]; e.target.value = ''; upload(f); };
+$('gal').onchange = (e) => { const f = [...e.target.files]; e.target.value = ''; upload(f); };
+
+$('fin').onclick = async () => {
+  if (!pages.length) return; localStorage.setItem('s2p_label', $('label').value);
+  $('fin').disabled = true; $('add').disabled = true; msg(`<span class="spinner"></span>PDF wird erstellt (OCR, ca. ${pages.length * 12} s) …`);
+  const fd = new FormData(); fd.append('label', $('label').value); fd.append('ocr', '1'); fd.append('paperless', $('pl').checked ? '1' : '0');
+  fd.append('modus', $('modus').value); fd.append('ordner', $('ordner').value);
+  try {
+    const r = await fetch(`/api/scan/${sid}/finish`, { method: 'POST', body: fd }); const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status);
+    sessionStorage.removeItem('s2p_sid'); sid = null; pages = []; render(); $('label').value = '';
+    msg(`✅ PDF fertig — ${j.pages} Seite(n), ${j.size_kb} KB` + (j.paperless ? `<br>📥 Paperless: ${j.paperless}` : '') +
+      (j.paperless_error ? `<br><span class="err">Paperless-Fehler: ${j.paperless_error}</span>` : '') +
+      `<br><a href="/download/${encodeURIComponent(j.file)}">⬇︎ PDF herunterladen</a>`, 'ok');
+  } catch (err) { msg('❌ ' + err.message, 'err'); } finally { $('add').disabled = false; $('fin').disabled = pages.length === 0; }
+};
+
+/* ---------- Rand-Editor ---------- */
+let cur = null, q = [], dragging = -1, W = 0, H = 0, sc = 1, ox = 0, oy = 0;
+const img = $('edimg'), svg = $('edsvg'), wrap = $('edwrap');
+function layout() {
+  const bw = wrap.clientWidth, bh = wrap.clientHeight; sc = Math.min(bw / W, bh / H);
+  const w = W * sc, h = H * sc; ox = (bw - w) / 2; oy = (bh - h) / 2;
+  img.style.cssText = `left:${ox}px;top:${oy}px;width:${w}px;height:${h}px`;
+  svg.setAttribute('width', bw); svg.setAttribute('height', bh); draw();
+}
+function px(i) { return [ox + q[i][0] * W * sc, oy + q[i][1] * H * sc]; }
+function draw() {
+  const P = q.map((_, i) => px(i)); let h = `<polygon points="${P.map(p => p.join(',')).join(' ')}" fill="#4f8cff22" stroke="#4f8cff" stroke-width="2"/>`;
+  P.forEach((p, i) => { h += `<circle cx="${p[0]}" cy="${p[1]}" r="26" fill="#4f8cff33" stroke="#fff" stroke-width="2"/><circle cx="${p[0]}" cy="${p[1]}" r="5" fill="#fff"/>`; });
+  svg.innerHTML = h;
+}
+function openEditor(p) {
+  cur = p; q = p.quad.map(c => [...c]); $('ed').style.display = 'flex';
+  img.onload = () => { W = img.naturalWidth; H = img.naturalHeight; layout(); };
+  img.src = p.src + '?t=' + Date.now(); if (img.complete && img.naturalWidth) { W = img.naturalWidth; H = img.naturalHeight; layout(); }
+}
+function evpt(e) { const r = wrap.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+wrap.addEventListener('pointerdown', (e) => {
+  const [x, y] = evpt(e); let best = -1, bd = 1e9;
+  q.forEach((_, i) => { const [px_, py_] = px(i), d = Math.hypot(px_ - x, py_ - y); if (d < bd) { bd = d; best = i; } });
+  if (bd < 70) { dragging = best; wrap.setPointerCapture(e.pointerId); e.preventDefault(); }
+});
+wrap.addEventListener('pointermove', (e) => {
+  if (dragging < 0) return; const [x, y] = evpt(e);
+  q[dragging] = [Math.min(1, Math.max(0, (x - ox) / (W * sc))), Math.min(1, Math.max(0, (y - oy) / (H * sc)))]; draw();
+});
+['pointerup', 'pointercancel'].forEach(t => wrap.addEventListener(t, () => { dragging = -1; }));
+window.addEventListener('resize', () => { if ($('ed').style.display === 'flex') layout(); });
+$('edall').onclick = () => { q = [[0.01, 0.01], [0.99, 0.01], [0.99, 0.99], [0.01, 0.99]]; draw(); };
+$('edcancel').onclick = () => { $('ed').style.display = 'none'; };
+$('edok').onclick = async () => {
+  $('edok').disabled = true; $('edinfo').innerHTML = '<span class="spinner"></span>wird neu berechnet …';
+  try {
+    const r = await fetch(`/api/scan/${sid}/quad/${cur.id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ quad: q }) });
+    const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status);
+    pages = pages.map(p => p.id === cur.id ? j.page : p); render(); $('ed').style.display = 'none'; msg('✅ Rand übernommen.', 'ok');
+  } catch (err) { $('edinfo').textContent = '❌ ' + err.message; } finally { $('edok').disabled = false; }
+};
+ensure();
+</script></body></html>"""
+
+
+@app.route("/scan")
+def scan_page():
+    return render_template_string(SCAN_PAGE)
+
+
+@app.route("/api/scan/new", methods=["POST"])
+def api_scan_new():
+    _scan_cleanup()
+    sid = uuid.uuid4().hex[:12]
+    d = _scan_dir(sid, create=True)
+    _scan_save(d, {"pages": []})
+    return jsonify(sid=sid)
+
+
+@app.route("/api/scan/<sid>")
+def api_scan_get(sid):
+    d = _scan_dir(sid)
+    if not d:
+        return jsonify(error="Sitzung unbekannt"), 404
+    return jsonify(pages=[_page_public(sid, pg) for pg in _scan_meta(d)["pages"]])
+
+
+@app.route("/api/scan/<sid>/add", methods=["POST"])
+def api_scan_add(sid):
+    d = _scan_dir(sid)
+    if not d:
+        return jsonify(error="Sitzung unbekannt"), 404
+    f = request.files.get("file")
+    if not f:
+        return jsonify(error="kein Bild"), 400
+    try:
+        frame = pipeline.prepare_frame(Image.open(io.BytesIO(f.read())))
+    except Exception as exc:
+        return jsonify(error=f"Bild nicht lesbar: {exc}"), 400
+    meta = _scan_meta(d)
+    pid = uuid.uuid4().hex[:8]
+    frame.save(d / f"{pid}.src.jpg", quality=90)
+    quad = pipeline.detect_quad_norm(frame)
+    auto = quad is not None
+    if quad is None:                      # nichts Verlaessliches erkannt: ganzes Bild, von Hand anpassbar
+        quad = [[0.02, 0.02], [0.98, 0.02], [0.98, 0.98], [0.02, 0.98]]
+    pg = {"id": pid, "quad": quad, "auto": auto}
+    try:
+        _render_page(d, pg)
+    except Exception as exc:
+        (d / f"{pid}.src.jpg").unlink(missing_ok=True)
+        return jsonify(error=str(exc)), 500
+    meta["pages"].append(pg)
+    _scan_save(d, meta)
+    return jsonify(page=_page_public(sid, pg), count=len(meta["pages"]))
+
+
+@app.route("/api/scan/<sid>/quad/<pid>", methods=["POST"])
+def api_scan_quad(sid, pid):
+    d = _scan_dir(sid)
+    if not d:
+        return jsonify(error="Sitzung unbekannt"), 404
+    meta = _scan_meta(d)
+    pg = next((p for p in meta["pages"] if p["id"] == pid), None)
+    if not pg:
+        return jsonify(error="Seite unbekannt"), 404
+    quad = (request.get_json(silent=True) or {}).get("quad")
+    try:
+        old = pg["quad"]
+        pg["quad"] = [[float(x), float(y)] for x, y in quad]
+        pg["auto"] = False
+        _render_page(d, pg)
+    except Exception as exc:
+        pg["quad"] = old
+        return jsonify(error=str(exc)), 400
+    _scan_save(d, meta)
+    return jsonify(page=_page_public(sid, pg))
+
+
+@app.route("/api/scan/<sid>/delete/<pid>", methods=["POST"])
+def api_scan_delete(sid, pid):
+    d = _scan_dir(sid)
+    if not d or not re.match(r"^[0-9a-f]{8}$", pid):
+        return jsonify(error="unbekannt"), 404
+    meta = _scan_meta(d)
+    meta["pages"] = [p for p in meta["pages"] if p["id"] != pid]
+    for ext in ("src.jpg", "page.png", "page.jpg"):
+        (d / f"{pid}.{ext}").unlink(missing_ok=True)
+    _scan_save(d, meta)
+    return jsonify(pages=[_page_public(sid, pg) for pg in meta["pages"]])
+
+
+@app.route("/api/scan/<sid>/move/<pid>", methods=["POST"])
+def api_scan_move(sid, pid):
+    d = _scan_dir(sid)
+    if not d:
+        return jsonify(error="Sitzung unbekannt"), 404
+    meta = _scan_meta(d)
+    pages = meta["pages"]
+    i = next((k for k, p in enumerate(pages) if p["id"] == pid), None)
+    if i is None:
+        return jsonify(error="Seite unbekannt"), 404
+    j = i + (1 if (request.get_json(silent=True) or {}).get("dir") == "down" else -1)
+    if 0 <= j < len(pages):
+        pages[i], pages[j] = pages[j], pages[i]
+        _scan_save(d, meta)
+    return jsonify(pages=[_page_public(sid, pg) for pg in pages])
+
+
+@app.route("/api/scan/<sid>/img/<name>")
+def api_scan_img(sid, name):
+    d = _scan_dir(sid)
+    if not d or not re.match(r"^[0-9a-f]{8}\.(src|page)\.(jpg|png)$", name):
+        return jsonify(error="unbekannt"), 404
+    resp = send_from_directory(d, name)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/scan/<sid>/finish", methods=["POST"])
+def api_scan_finish(sid):
+    d = _scan_dir(sid)
+    if not d:
+        return jsonify(error="Sitzung unbekannt"), 404
+    meta = _scan_meta(d)
+    if not meta["pages"]:
+        return jsonify(error="keine Seiten"), 400
+    try:
+        pages = [Image.open(d / f"{pg['id']}.page.png").convert("RGB") for pg in meta["pages"]]
+        result = pipeline.process_pages(pages, WORK, OUT, do_ocr=request.form.get("ocr", "1") == "1")
+    except Exception as exc:
+        return jsonify(error=str(exc)), 500
+    result["created"] = int(os.path.getmtime(OUT / result["file"]))
+    result["label"] = (request.form.get("label") or "").strip()
+    if request.form.get("paperless") == "1":
+        try:
+            dst = _to_paperless(OUT / result["file"], result["label"],
+                                request.form.get("modus", "archivieren"), request.form.get("ordner", ""))
+            result["paperless"] = f"{dst.parent.relative_to(PAPERLESS_CONSUME)}/{dst.name}"
+        except Exception as exc:
+            result["paperless_error"] = str(exc)
+    _add_meta(result)
+    shutil.rmtree(d, ignore_errors=True)
+    return jsonify(result)
+
+
+@app.route("/api/scan/<sid>/discard", methods=["POST"])
+def api_scan_discard(sid):
+    d = _scan_dir(sid)
+    if d:
+        shutil.rmtree(d, ignore_errors=True)
+    return jsonify(ok=True)
 
 
 @app.route("/health")

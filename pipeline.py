@@ -397,6 +397,55 @@ def _extract_page(img):
     return work
 
 
+def prepare_frame(img):
+    """Foto -> einheitlicher Bezugsrahmen (EXIF gedreht, max. 4000 px). Alle Ecken-Koordinaten
+    des Scan-Modus beziehen sich normiert (0..1) auf diesen Rahmen."""
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    if max(img.size) > 4000:
+        img.thumbnail((4000, 4000), Image.LANCZOS)
+    return img
+
+
+def detect_quad_norm(frame):
+    """Blattecken [[x,y]*4] (TL,TR,BR,BL), normiert 0..1 — oder None, wenn nichts Verlaessliches
+    gefunden wurde (dann setzt die Oberflaeche den Rahmen auf das ganze Bild)."""
+    if cv2 is None:
+        return None
+    img = ImageOps.autocontrast(frame, cutoff=1, preserve_tone=False)
+    bgr = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+    if _is_scan(bgr):                    # schon sauber gescannt -> ganzes Bild
+        return None
+    quad = _find_quad_edges(bgr)
+    if quad is None:
+        quad = _find_quad(bgr)
+    if quad is None:
+        return None
+    h, w = bgr.shape[:2]
+    return (quad / np.array([w, h], dtype=np.float32)).tolist()
+
+
+def extract_with_quad(frame, quad_norm):
+    """Zuschnitt mit vorgegebenen (ggf. von Hand korrigierten) Ecken: entzerren, Ausleuchtung
+    normalisieren. Reihenfolge der Ecken = TL,TR,BR,BL wie geliefert (keine Neusortierung)."""
+    img = ImageOps.autocontrast(frame, cutoff=1, preserve_tone=False)
+    bgr = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+    quad = (np.array(quad_norm, dtype=np.float32) * np.array([w, h], dtype=np.float32))
+    quad = np.clip(quad, [0, 0], [w - 1, h - 1]).astype(np.float32)
+    if quad.shape != (4, 2):
+        raise ValueError("vier Ecken noetig")
+    if not cv2.isContourConvex(quad.reshape(-1, 1, 2)):
+        raise ValueError("Ecken ueberkreuzt - bitte die Punkte neu setzen")
+    if cv2.contourArea(quad) < 0.02 * w * h:
+        raise ValueError("Ausschnitt zu klein")
+    work = _warp_quad(bgr, quad)
+    if work is None:
+        raise ValueError("Ausschnitt zu klein")
+    work = _whiteout_border(work)
+    work = _flatten_illumination(work)
+    return _whiteout_border(work)
+
+
 def _flatten_illumination(img):
     """Ausleuchtung normalisieren: Schatten/Flecken -> gleichmaessig weisses Papier.
 
@@ -494,9 +543,8 @@ def to_a4(img, margin_mm=MARGIN_MM, dpi=DPI):
     return page
 
 
-def images_to_pdf(images, out_path, dpi=DPI):
-    """Mehrere A4-Seiten in ein PDF schreiben."""
-    pages = [to_a4(_extract_page(im), dpi=dpi) for im in images]
+def pages_to_pdf(pages, out_path, dpi=DPI):
+    """Fertige A4-Seiten (PIL) in ein PDF schreiben."""
     if not pages:
         raise ValueError("keine Bilder")
     c = canvas.Canvas(str(out_path), pagesize=(595.2, 841.9))
@@ -511,6 +559,11 @@ def images_to_pdf(images, out_path, dpi=DPI):
         c.showPage()
     c.save()
     return len(pages)
+
+
+def images_to_pdf(images, out_path, dpi=DPI):
+    """Mehrere Bilder (Fotos) freistellen, auf A4 legen, in ein PDF schreiben."""
+    return pages_to_pdf([to_a4(_extract_page(im), dpi=dpi) for im in images], out_path, dpi)
 
 
 def ocr_pdf(in_path, out_path, container=OCR_CONTAINER, lang=OCR_LANG):
@@ -580,8 +633,17 @@ def process_job(images, work_root, out_dir, do_ocr=True):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     pages = [to_a4(_extract_page(im)) for im in images]
+    return process_pages(pages, work_root, out_dir, do_ocr, job_id=job_id)
+
+
+def process_pages(pages, work_root, out_dir, do_ocr=True, job_id=None):
+    """Fertige A4-Seiten -> OCR -> ein PDF. (Gemeinsamer Teil von Foto- und Scan-Modus.)"""
     if not pages:
         raise ValueError("keine Bilder")
+    job_id = job_id or uuid.uuid4().hex[:12]
+    job_dir = Path(work_root) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     ocr_ok, ocr_msg, text = False, "deaktiviert", ""
     if do_ocr:
@@ -606,11 +668,11 @@ def process_job(images, work_root, out_dir, do_ocr=True):
         else:
             ocr_msg = errors[-1] if errors else "ocr fehlgeschlagen"
             fallback = job_dir / "raw.pdf"
-            images_to_pdf(images, fallback)
+            pages_to_pdf(pages, fallback)
             src = fallback
     else:
         fallback = job_dir / "raw.pdf"
-        images_to_pdf(images, fallback)
+        pages_to_pdf(pages, fallback)
         src = fallback
 
     final = Path(out_dir) / f"scan-{job_id}.pdf"
