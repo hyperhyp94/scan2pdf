@@ -6,6 +6,7 @@ profil), Rest-Untergrund weiss uebermalen, dann auf A4 setzen und OCR.
 """
 import io
 import os
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -676,7 +677,7 @@ def process_pages(pages, work_root, out_dir, do_ocr=True, job_id=None):
         src = fallback
 
     final = Path(out_dir) / f"scan-{job_id}.pdf"
-    os.replace(src, final)
+    shutil.move(str(src), str(final))   # auch ueber Laufwerksgrenzen (z. B. --out /tmp)
     for leftover in job_dir.iterdir():
         leftover.unlink(missing_ok=True)
     try:

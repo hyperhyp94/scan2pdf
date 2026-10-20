@@ -21,7 +21,7 @@ BASE = Path(__file__).resolve().parent
 WORK = BASE / "work"
 OUT = BASE / "data" / "out"
 META = BASE / "data" / "results.json"
-PAPERLESS_CONSUME = Path("/mnt/ssd/paperless-consume")
+PAPERLESS_CONSUME = Path(os.environ.get("S2P_CONSUME", "/mnt/ssd/paperless-consume"))
 
 WORK.mkdir(parents=True, exist_ok=True)
 OUT.mkdir(parents=True, exist_ok=True)
