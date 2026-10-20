@@ -273,6 +273,68 @@ def index():
     return render_template_string(PAGE)
 
 
+KAMERA_PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Scan2PDF Kamera</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --acc:#4f8cff; --txt:#e8eaf0; --ok:#3ccf7a; --err:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--txt);
+         min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px 16px; }
+  h1 { font-size:22px; margin:8px 0 4px; }
+  .sub { color:#8b93a7; font-size:14px; margin-bottom:24px; text-align:center; }
+  .cam { width:100%; max-width:420px; padding:34px 0; font-size:28px; font-weight:700;
+         border:0; border-radius:18px; background:var(--acc); color:#fff; cursor:pointer; }
+  .cam:disabled { opacity:.5; }
+  .status { margin-top:22px; font-size:16px; min-height:24px; text-align:center; }
+  .ok { color:var(--ok); } .err { color:var(--err); }
+  .spinner { display:inline-block; width:16px; height:16px; border:2px solid #555; border-top-color:var(--acc);
+             border-radius:50%; animation:s 1s linear infinite; vertical-align:-3px; margin-right:8px; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .dl { display:inline-block; margin-top:14px; padding:12px 18px; border-radius:12px; background:var(--card);
+        color:var(--txt); text-decoration:none; border:1px solid #2a2f3a; }
+  .nav { margin-top:30px; color:#8b93a7; font-size:14px; }
+  .nav a { color:var(--acc); }
+  input[type=file] { display:none; }
+</style></head><body>
+  <h1>📷 Scan2PDF</h1>
+  <div class="sub">Tippen → Foto machen → PDF wird automatisch erstellt (OCR, A4)</div>
+  <input type="file" id="cam" accept="image/*" capture="environment">
+  <button class="cam" id="btn">Foto aufnehmen</button>
+  <div class="status" id="status"></div>
+  <div class="nav"><a href="/">Zur Vollansicht (Mehrere Fotos, Paperless)</a></div>
+<script>
+const $ = (id) => document.getElementById(id);
+$('btn').onclick = () => $('cam').click();
+$('cam').onchange = async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  const fd = new FormData();
+  fd.append('files', f);
+  fd.append('ocr', '1');
+  $('btn').disabled = true;
+  $('status').innerHTML = '<span class="spinner"></span>Foto wird zu PDF verarbeitet …';
+  try {
+    const r = await fetch('/api/process', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    $('status').innerHTML = '<span class="ok">✅ PDF fertig — ' + j.pages + ' Seite, ' + j.size_kb + ' KB</span><br>' +
+      '<a class="dl" href="/download/' + encodeURIComponent(j.file) + '">⬇︎ PDF herunterladen</a>';
+  } catch (err) {
+    $('status').innerHTML = '<span class="err">❌ ' + err.message + '</span>';
+  } finally {
+    $('btn').disabled = false;
+  }
+};
+</script></body></html>"""
+
+
+@app.route("/kamera")
+def kamera():
+    return render_template_string(KAMERA_PAGE)
+
+
 @app.route("/api/process", methods=["POST"])
 def api_process():
     files = request.files.getlist("files")
