@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -43,6 +44,31 @@ def _add_meta(entry):
     items = [i for i in _load_meta() if i.get("file") != entry["file"]]
     items.insert(0, entry)
     _save_meta(items)
+
+
+def _consume_name(label, fallback):
+    """Dateiname fuer Paperless. 'Titel (tag1,tag2)' -> 'Titel (tag1,tag2).pdf' —
+    der Paperless-Tagger liest die Klammer am Ende als Tags (wie bei den Nextcloud-Ordnern)."""
+    label = re.sub(r'[\\/:*?"<>|\x00-\x1f]', " ", (label or "")).strip()
+    label = re.sub(r"\s+", " ", label)
+    if not label:
+        return fallback
+    m = re.search(r"\(([^()]*)\)\s*$", label)
+    title = (label[:m.start()] if m else label).strip() or "Scan"
+    tags = ",".join(t.strip() for t in m.group(1).split(",") if t.strip()) if m else ""
+    base = f"{title} ({tags})" if tags else title
+    name, n = f"{base}.pdf", 2
+    while (PAPERLESS_CONSUME / name).exists():          # Kollision: Zaehler VOR der Klammer
+        name = (f"{title} {n} ({tags}).pdf" if tags else f"{title} {n}.pdf")
+        n += 1
+    return name
+
+
+def _to_paperless(src, label=""):
+    PAPERLESS_CONSUME.mkdir(parents=True, exist_ok=True)
+    dst = PAPERLESS_CONSUME / _consume_name(label, src.name)
+    shutil.copy2(src, dst)
+    return dst
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -139,6 +165,14 @@ PAGE = r"""<!DOCTYPE html>
   <div class="thumbs" id="thumbs"></div>
 
   <div class="row">
+    <input type="text" id="label" placeholder="Titel (tag1,tag2,tag3)" autocomplete="off" autocapitalize="off"
+           style="width:100%;height:auto;padding:12px;font-size:16px;border-radius:10px;border:1px solid #2a2f3a;background:var(--card);color:inherit">
+  </div>
+  <div class="row">
+    <input type="checkbox" id="pl">
+    <label for="pl">direkt nach Paperless (Tags aus der Klammer)</label>
+  </div>
+  <div class="row">
     <input type="checkbox" id="ocr" checked>
     <label for="ocr">OCR (durchsuchbares PDF, deutsch)</label>
   </div>
@@ -203,16 +237,18 @@ $('go').onclick = async () => {
   const fd = new FormData();
   files.forEach(f => fd.append('files', f));
   fd.append('ocr', $('ocr').checked ? '1' : '0');
+  fd.append('label', $('label').value);
+  fd.append('paperless', $('pl').checked ? '1' : '0');
   $('go').disabled = true;
   $('status').innerHTML = '<span class="spinner"></span>Wird verarbeitet … (OCR dauert ein paar Sekunden pro Seite)';
   try {
     const r = await fetch('/api/process', { method: 'POST', body: fd });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-    files.length = 0; render();
-    $('status').innerHTML = j.ocr
+    files.length = 0; render(); $('label').value = '';
+    $('status').innerHTML = (j.paperless ? '📥 → Paperless: ' + j.paperless + '<br>' : '') + (j.ocr
       ? '✅ Fertig — ' + j.pages + ' Seite(n), OCR ok'
-      : '⚠️ Fertig ohne OCR — ' + j.pages + ' Seite(n)';
+      : '⚠️ Fertig ohne OCR — ' + j.pages + ' Seite(n)');
     loadResults();
   } catch (err) {
     $('status').textContent = '❌ Fehler: ' + err.message;
@@ -296,9 +332,15 @@ KAMERA_PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
   .nav { margin-top:30px; color:#8b93a7; font-size:14px; }
   .nav a { color:var(--acc); }
   input[type=file] { display:none; }
+  #label { width:100%; max-width:420px; padding:14px; margin-bottom:10px; font-size:17px; border-radius:12px;
+           border:1px solid #2a2f3a; background:var(--card); color:var(--txt); }
+  .chk { display:flex; gap:8px; align-items:center; margin-bottom:16px; color:#8b93a7; font-size:15px; }
+  .chk input { width:20px; height:20px; }
 </style></head><body>
   <h1>📷 Scan2PDF</h1>
   <div class="sub">Tippen → Foto machen → PDF wird automatisch erstellt (OCR, A4)</div>
+  <input type="text" id="label" placeholder="Titel (tag1,tag2,tag3)" autocomplete="off" autocapitalize="off">
+  <label class="chk"><input type="checkbox" id="pl" checked> direkt nach Paperless</label>
   <input type="file" id="cam" accept="image/*" capture="environment">
   <button class="cam" id="btn">Foto aufnehmen</button>
   <div class="status" id="status"></div>
@@ -313,14 +355,19 @@ $('cam').onchange = async (e) => {
   const fd = new FormData();
   fd.append('files', f);
   fd.append('ocr', '1');
+  fd.append('label', $('label').value);
+  fd.append('paperless', $('pl').checked ? '1' : '0');
   $('btn').disabled = true;
   $('status').innerHTML = '<span class="spinner"></span>Foto wird zu PDF verarbeitet …';
   try {
     const r = await fetch('/api/process', { method: 'POST', body: fd });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-    $('status').innerHTML = '<span class="ok">✅ PDF fertig — ' + j.pages + ' Seite, ' + j.size_kb + ' KB</span><br>' +
+    const pl = j.paperless ? '<br>📥 Paperless: ' + j.paperless
+             : (j.paperless_error ? '<br><span class="err">Paperless-Fehler: ' + j.paperless_error + '</span>' : '');
+    $('status').innerHTML = '<span class="ok">✅ PDF fertig — ' + j.pages + ' Seite, ' + j.size_kb + ' KB</span>' + pl + '<br>' +
       '<a class="dl" href="/download/' + encodeURIComponent(j.file) + '">⬇︎ PDF herunterladen</a>';
+    $('label').value = '';
   } catch (err) {
     $('status').innerHTML = '<span class="err">❌ ' + err.message + '</span>';
   } finally {
@@ -352,6 +399,13 @@ def api_process():
     except Exception as exc:
         return jsonify(error=str(exc)), 500
     result["created"] = int(os.path.getmtime(OUT / result["file"]))
+    result["label"] = (request.form.get("label") or "").strip()
+    if request.form.get("paperless") == "1":
+        try:
+            dst = _to_paperless(OUT / result["file"], result["label"])
+            result["paperless"] = dst.name
+        except Exception as exc:
+            result["paperless_error"] = str(exc)
     _add_meta(result)
     return jsonify(result)
 
@@ -373,13 +427,13 @@ def api_paperless(name):
     src = OUT / name
     if not src.exists():
         return jsonify(error="Datei fehlt"), 404
+    label = request.args.get("label") or next(
+        (i.get("label", "") for i in _load_meta() if i.get("file") == name), "")
     try:
-        PAPERLESS_CONSUME.mkdir(parents=True, exist_ok=True)
-        dst = PAPERLESS_CONSUME / name
-        shutil.copy2(src, dst)
+        dst = _to_paperless(src, label)
     except Exception as exc:
         return jsonify(error=str(exc)), 500
-    return jsonify(ok=True, target=str(dst))
+    return jsonify(ok=True, target=dst.name)
 
 
 @app.route("/health")
